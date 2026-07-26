@@ -37,7 +37,7 @@ python -m pytest -q tests/trace_r3
 mini-extra trace-r3 --help
 ```
 
-The expected TRACE-R³ result for this revision is `20 passed`.
+The expected TRACE-R³ result for this revision is `23 passed`.
 
 ## 3. Docker and Hugging Face environment
 

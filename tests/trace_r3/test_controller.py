@@ -33,8 +33,13 @@ def _repository(tmp_path):
     repository = tmp_path / "repository"
     repository.mkdir()
     (repository / "maths.py").write_text("def increment(value):\n    return value + 1\n")
+    (repository / "test_maths.py").write_text(
+        "from maths import increment\n\n"
+        "def test_increment():\n"
+        "    assert increment(1) == 3\n"
+    )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    subprocess.run(["git", "add", "maths.py"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "maths.py", "test_maths.py"], cwd=repository, check=True)
     subprocess.run(
         ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
         cwd=repository,
@@ -55,6 +60,10 @@ def _write_action(increment: int) -> dict:
 def _reproduction_action() -> dict:
     command = 'python -c "from maths import increment; assert increment(1) == 3"'
     return make_output("validating", [{"command": command}], cost=0.01)
+
+
+def _test_action() -> dict:
+    return make_output("testing", [{"command": "python -m pytest -q test_maths.py"}], cost=0.01)
 
 
 def _submit_action() -> dict:
@@ -103,7 +112,7 @@ def _controller(tmp_path, config):
 
 def test_green_baseline_never_activates_recovery(tmp_path, reset_global_stats):
     repository = _repository(tmp_path)
-    outputs = [_write_action(2), _reproduction_action(), _submit_action()]
+    outputs = [_write_action(2), _reproduction_action(), _test_action(), _submit_action()]
     controller = _controller(tmp_path, _config(repository, outputs))
 
     result = controller.run()
@@ -123,8 +132,8 @@ def test_green_baseline_never_activates_recovery(tmp_path, reset_global_stats):
 
 def test_failed_baseline_activates_graph_and_recovery(tmp_path, reset_global_stats):
     repository = _repository(tmp_path)
-    baseline = [_write_action(0), _reproduction_action(), _submit_action()]
-    recovery = [_write_action(2), _reproduction_action(), _submit_action()]
+    baseline = [_write_action(0), _reproduction_action(), _test_action(), _submit_action()]
+    recovery = [_write_action(2), _reproduction_action(), _test_action(), _submit_action()]
     controller = _controller(tmp_path, _config(repository, baseline, recovery))
 
     result = controller.run()
@@ -161,7 +170,7 @@ def test_recovery_keeps_model_and_enables_max_reasoning(tmp_path):
 
 def test_repeated_failures_recreate_clean_b0_and_stop_after_three_epochs(tmp_path, reset_global_stats):
     repository = _repository(tmp_path)
-    failure = [_write_action(0), _reproduction_action(), _submit_action()]
+    failure = [_write_action(0), _reproduction_action(), _test_action(), _submit_action()]
     config = _config(repository, failure, failure)
     config["environment"]["environment_class"] = (
         "tests.trace_r3.test_controller.ResettingLocalEnvironment"

@@ -11,8 +11,10 @@ from typing import Any
 from minisweagent import Environment
 from minisweagent.trace_r3.types import GateCheck, GateReport, GateState, TraceR3Config
 
+_COMMAND_BOUNDARY = r"(?:^|(?:&&|\|\||;|\||\r?\n)\s*)"
 _TEST_COMMAND = re.compile(
-    r"(?:^|[\s;&])(?:"
+    _COMMAND_BOUNDARY
+    + r"(?:timeout\s+\S+\s+)?(?:"
     r"pytest|py\.test|tox|nox|"
     r"python(?:\d+(?:\.\d+)?)?\s+-m\s+(?:pytest|unittest|sympy\.testing\.runtests)|"
     r"\./gradlew\s+test|mvn\s+(?:test|verify)|npm\s+(?:run\s+)?test|cargo\s+test|go\s+test"
@@ -68,14 +70,15 @@ class GateEvaluator:
 
         has_test = any(candidate.kind == "test" for candidate in candidates)
         has_repro = any(candidate.kind == "reproduction" for candidate in candidates)
-        checks.append(
-            GateCheck(
-                "behavioral_evidence",
-                True if has_test or has_repro else None,
-                "Replayed final behavioral evidence" if has_test or has_repro else "No safe test or reproduction command found",
-                critical=False,
-            )
+        behavioral_passed = True if has_test else None
+        behavioral_detail = (
+            "Replayed a real test command"
+            if has_test
+            else "Only reproduction evidence was replayed; a real test command is required"
+            if has_repro
+            else "No safe test or reproduction command found"
         )
+        checks.append(GateCheck("behavioral_evidence", behavioral_passed, behavioral_detail, critical=False))
 
         state, reason = _classify(checks)
         return GateReport(

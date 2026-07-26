@@ -34,11 +34,15 @@ It captures the real `git diff`, checks:
 - changed Python syntax;
 - no modifications to test files;
 - configurable patch scope limits;
-- replay of the final safe reproduction/test commands found in the trajectory.
+- replay of the final safe reproduction and real test-runner commands found in
+  the trajectory.
 
 Replayed pipelines run under `bash -o pipefail`. Commands masked with `|| true`
 or equivalent constructs are excluded. A zero exit status with no collected
-tests or skipped-only evidence is not accepted as a pass.
+tests or skipped-only evidence is not accepted as a pass. Importing or
+installing a test framework is not a test command. Reproduction scripts are
+retained as useful evidence, but cannot make a gate green without a genuine
+test-runner invocation.
 
 ### LLM-consumable one-hop graph RAG
 
