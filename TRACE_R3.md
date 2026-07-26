@@ -139,6 +139,10 @@ of these conditions occurs:
 - two consecutive checkpoints do not improve;
 - the per-epoch checkpoint limit is reached.
 
+Failure signatures use gate state, failed/unknown check names, and return
+codes. Volatile command output such as temporary paths, worker IDs, and timing
+does not affect rollback decisions.
+
 At the third epoch, the same condition stops recovery and selects the
 highest-scoring observed candidate as a clearly marked best-effort result.
 

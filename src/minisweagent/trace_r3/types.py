@@ -71,13 +71,16 @@ class GateReport:
         return state_score, passed, -failed
 
     def fingerprint(self) -> str:
-        """Stable failure signature for loop detection."""
+        """Return a structural failure signature for deterministic loop detection.
+
+        Command output is deliberately excluded: paths, timings, worker IDs,
+        and tool versions vary across otherwise equivalent validation runs.
+        """
 
         parts = [self.state.value]
         for check in self.checks:
             if check.passed is not True:
-                normalized = " ".join(check.output.lower().split())[-300:]
-                parts.append(f"{check.name}:{check.passed}:{check.returncode}:{normalized}")
+                parts.append(f"{check.name}:{check.passed}:{check.returncode}")
         return "|".join(parts)
 
     def to_dict(self, *, include_patch: bool = True) -> dict[str, Any]:

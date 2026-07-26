@@ -73,6 +73,43 @@ def test_repeated_failure_seals_epoch_and_third_epoch_stops():
     assert final.decision is CheckpointDecision.STOP
 
 
+def test_failure_fingerprint_ignores_volatile_command_output():
+    first = GateReport(
+        state=GateState.RED,
+        checks=(
+            GateCheck(
+                "replay_test",
+                False,
+                "failed",
+                returncode=1,
+                output="/tmp/pytest-of-user/pytest-1/test_case failed in 0.31s",
+            ),
+        ),
+        patch="A",
+        changed_files=("source.py",),
+        added_lines=1,
+        deleted_lines=0,
+    )
+    second = GateReport(
+        state=GateState.RED,
+        checks=(
+            GateCheck(
+                "replay_test",
+                False,
+                "failed",
+                returncode=1,
+                output="/tmp/pytest-of-runner/pytest-8/test_case failed in 1.72s",
+            ),
+        ),
+        patch="B",
+        changed_files=("source.py",),
+        added_lines=2,
+        deleted_lines=1,
+    )
+
+    assert first.fingerprint() == second.fingerprint()
+
+
 def test_graph_depth_is_fixed_to_one_hop():
     with pytest.raises(ValueError, match="one-hop"):
         TraceR3Config(graph_depth=2)
