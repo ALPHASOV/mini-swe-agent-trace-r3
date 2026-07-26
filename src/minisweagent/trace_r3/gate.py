@@ -17,19 +17,41 @@ _TEST_COMMAND = re.compile(
     + r"(?:timeout\s+\S+\s+)?(?:"
     r"pytest|py\.test|tox|nox|"
     r"python(?:\d+(?:\.\d+)?)?\s+-m\s+(?:pytest|unittest|sympy\.testing\.runtests)|"
+    r"python(?:\d+(?:\.\d+)?)?\s+(?:\./)?bin/test|(?:\./)?bin/test|"
     r"\./gradlew\s+test|mvn\s+(?:test|verify)|npm\s+(?:run\s+)?test|cargo\s+test|go\s+test"
     r")(?:[\s;&]|$)",
     re.IGNORECASE,
+)
+_INLINE_TEST_COMMAND = re.compile(
+    r"\bpython(?:\d+(?:\.\d+)?)?\s+-c\b.*"
+    r"\b(?:sympy\.test|pytest\.main|unittest\.main)\s*\(",
+    re.IGNORECASE | re.DOTALL,
 )
 _REPRO_COMMAND = re.compile(
     r"(?:python(?:\d+(?:\.\d+)?)?\s+(?:-c|-|[^;&\s]+\.py)\b.*\bassert\b|"
     r"\b(?:repro|reproduce|regression)[_\-.a-zA-Z0-9]*\.(?:py|sh)\b)",
     re.IGNORECASE | re.DOTALL,
 )
-_MASKED_COMMAND = re.compile(r"\|\|\s*(?:true|:)\b|;\s*(?:true|:)\s*$", re.IGNORECASE)
+_MASKED_COMMAND = re.compile(r"\|\||;\s*(?:true|:)\s*$", re.IGNORECASE)
 _SKIPPED_ONLY = re.compile(
     r"(?:no tests ran|collected 0 items|\b0 passed\b|all tests (?:were )?skipped|nothing to test)",
     re.IGNORECASE,
+)
+_FAILED_TEST_EVIDENCE = re.compile(
+    r"(?:\b[1-9]\d*\s+failed\b|\bFAILURES?\b|\bFAILED(?:\s*\(|\b)|"
+    r"\bBUILD FAILURE\b|\btest result:\s*FAILED\b|\berrors?=[1-9]\d*\b)",
+    re.IGNORECASE,
+)
+_POSITIVE_TEST_EVIDENCE = (
+    re.compile(r"\b[1-9]\d*\s+passed\b", re.IGNORECASE),
+    re.compile(r"\bRan\s+[1-9]\d*\s+tests?\b", re.IGNORECASE),
+    re.compile(r"\btest result:\s*ok\b.*\b[1-9]\d*\s+passed\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"^\s*ok\s+\S+(?:\s+\d+(?:\.\d+)?s)?\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(
+        r"\bTests run:\s*[1-9]\d*\b.*\bFailures:\s*0\b.*\bErrors:\s*0\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"\b[1-9]\d*\s+tests?\s+(?:completed|run)\b.*\b0\s+failed\b", re.IGNORECASE | re.DOTALL),
 )
 _TEST_FILE = re.compile(r"(^|/)tests?(?:/|$)|(?:^|/)test_[^/]+\.py$|_test\.py$")
 
@@ -139,15 +161,28 @@ class GateEvaluator:
     def _replay(self, env: Environment, candidate: CommandCandidate) -> GateCheck:
         command = f"bash -o pipefail -c {shlex.quote(candidate.command)}"
         result = self._execute(env, command)
-        skipped_only = result["returncode"] == 0 and bool(_SKIPPED_ONLY.search(result["output"]))
-        passed = result["returncode"] == 0 and not skipped_only
-        detail = (
-            f"Replayed {candidate.kind} command successfully"
-            if passed
-            else "Command produced only skipped/empty tests"
-            if skipped_only
-            else f"Replayed {candidate.kind} command failed with return code {result['returncode']}"
+        output = str(result.get("output", ""))
+        skipped_only = result["returncode"] == 0 and bool(_SKIPPED_ONLY.search(output))
+        failed_evidence = candidate.kind == "test" and bool(_FAILED_TEST_EVIDENCE.search(output))
+        positive_evidence = candidate.kind != "test" or any(
+            pattern.search(output) for pattern in _POSITIVE_TEST_EVIDENCE
         )
+        passed = (
+            result["returncode"] == 0
+            and not skipped_only
+            and not failed_evidence
+            and positive_evidence
+        )
+        if passed:
+            detail = f"Replayed {candidate.kind} command successfully"
+        elif skipped_only:
+            detail = "Command produced only skipped/empty tests"
+        elif failed_evidence:
+            detail = "Test output reports failures despite the command return code"
+        elif result["returncode"] == 0 and candidate.kind == "test":
+            detail = "Runner exited successfully but gave no positive evidence that any test executed"
+        else:
+            detail = f"Replayed {candidate.kind} command failed with return code {result['returncode']}"
         return GateCheck(
             f"replay_{candidate.kind}",
             passed,
@@ -170,7 +205,13 @@ def extract_validation_commands(messages: Iterable[dict[str, Any]], *, limit: in
             command = action.get("command", "").strip()
             if not command or command in seen or "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in command:
                 continue
-            kind = "test" if _TEST_COMMAND.search(command) else "reproduction" if _REPRO_COMMAND.search(command) else ""
+            kind = (
+                "test"
+                if _TEST_COMMAND.search(command) or _INLINE_TEST_COMMAND.search(command)
+                else "reproduction"
+                if _REPRO_COMMAND.search(command)
+                else ""
+            )
             if not kind or _MASKED_COMMAND.search(command):
                 continue
             seen.add(command)

@@ -80,13 +80,23 @@ Reason: {gate_report.reason}
 Use the failed patch only as a draft anchor:
 1. Restate the behavioral invariant and an alternative root-cause hypothesis.
 2. Inspect the changed target plus the supplied direct upstream callers and
-   direct downstream callees. Verify every graph edge in source before relying
-   on it; static resolution is navigation evidence, not semantic proof.
+   direct downstream callees, including inherited-method consumers when
+   present. Verify every graph edge in source before relying on it; static
+   resolution is navigation evidence, not semantic proof.
 3. Check what callers pass, how return values/exceptions are consumed, and what
-   callees promise. Preserve those contracts.
-4. Implement the smallest candidate consistent with that evidence.
-5. Run an explicit issue reproduction and focused native tests. Do not hide
-   failures behind pipes, `|| true`, output truncation, or skipped-only tests.
+   callees promise. Preserve those contracts. A failure in a neighboring case
+   is evidence that the invariant is incomplete; do not dismiss it merely
+   because the issue did not name that case.
+4. Implement the smallest distinct source candidate consistent with that
+   evidence. A recovery checkpoint must not resubmit a byte-identical patch.
+5. For shared/base/dispatch code, inspect subclass or cross-module consumers
+   and test at least one relevant consumer surface in addition to the closest
+   unit tests.
+6. Run an explicit issue reproduction and focused native tests. Test commands
+   must emit a positive nonzero test-count summary. Do not use `||` fallbacks,
+   hide failures behind pipes, truncate away the summary, or accept skipped-only
+   tests. If pytest is unavailable, invoke the repository's native test runner
+   directly.
 </context_inlining_protocol>
 
 {graph_context}

@@ -48,6 +48,8 @@ class Definition:
     class_name: str
     parameters: tuple[str, ...]
     import_bindings: tuple[tuple[str, str], ...]
+    class_qualified_name: str = ""
+    base_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,45 @@ class DefinitionVisitor(ast.NodeVisitor):
         self.definition_stack: list[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+        parents = [*self.class_stack, *self.function_stack]
+        qualified_name = ".".join([self.module, *parents, node.name])
+        class_id = f"{self.path}:{node.lineno}:{qualified_name}"
+        base_hints = tuple(
+            hint
+            for base in node.bases
+            if (
+                hint := _qualified_hint(
+                    _dotted_name(base),
+                    module=self.module,
+                    class_name=self.class_stack[-1] if self.class_stack else "",
+                    import_bindings=self.import_bindings,
+                )
+            )
+        )
+        self.definitions.append(
+            Definition(
+                id=class_id,
+                qualified_name=qualified_name,
+                name=node.name,
+                kind="class",
+                path=self.path,
+                line=node.lineno,
+                end_line=getattr(node, "end_lineno", node.lineno),
+                signature=f"class {node.name}({', '.join(_unparse(base) for base in node.bases)})",
+                source=_source_slice(
+                    self.lines,
+                    node.lineno,
+                    getattr(node, "end_lineno", node.lineno),
+                    max_lines=60,
+                ),
+                module=self.module,
+                class_name=node.name,
+                parameters=(),
+                import_bindings=tuple(sorted(self.import_bindings.items())),
+                class_qualified_name=qualified_name,
+                base_hints=base_hints,
+            )
+        )
         self.class_stack.append(node.name)
         self.generic_visit(node)
         self.class_stack.pop()
@@ -171,6 +212,7 @@ class DefinitionVisitor(ast.NodeVisitor):
         definition_id = f"{self.path}:{node.lineno}:{qualified_name}"
         end_line = getattr(node, "end_lineno", node.lineno)
         class_name = self.class_stack[-1] if self.class_stack else ""
+        class_qualified_name = ".".join([self.module, *self.class_stack]) if self.class_stack else ""
         prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
         self.definitions.append(
             Definition(
@@ -199,6 +241,7 @@ class DefinitionVisitor(ast.NodeVisitor):
                     ]
                 ),
                 import_bindings=tuple(sorted(self.import_bindings.items())),
+                class_qualified_name=class_qualified_name,
             )
         )
         self.function_stack.append(node.name)
@@ -232,14 +275,18 @@ def build_graph(root: Path, *, max_files: int) -> tuple[list[Definition], list[E
         definitions.extend(visitor.definitions)
         calls.extend(visitor.calls)
         parsed_files += 1
-    edges = _resolve_calls(definitions, calls)
+    call_edges = _resolve_calls(definitions, calls)
+    inheritance_edges = _resolve_inheritance(definitions)
+    edges = [*call_edges, *inheritance_edges]
     return definitions, edges, {
         "parsed_files": parsed_files,
         "syntax_errors": syntax_errors,
         "definitions": len(definitions),
         "calls": len(calls),
         "resolved_edges": len(edges),
-        "unresolved_calls": max(0, len(calls) - len(edges)),
+        "resolved_call_edges": len(call_edges),
+        "inheritance_edges": len(inheritance_edges),
+        "unresolved_calls": max(0, len(calls) - len(call_edges)),
     }
 
 
@@ -259,11 +306,15 @@ def retrieve(
     seeds = _select_seeds(
         definitions,
         changed_ranges,
-        [*seed_terms, *anchor_sources],
+        [*anchor_sources, *seed_terms],
         max_seeds=max_seeds,
     )
     seed_ids = {seed.id for seed in seeds}
-    effective_edges = [edge for edge in edges if edge.source not in seed_ids]
+    effective_edges = [
+        edge
+        for edge in edges
+        if not (edge.source in seed_ids and edge.relation == "calls")
+    ]
     effective_edges.extend(
         edge
         for seed in seeds
@@ -273,6 +324,7 @@ def retrieve(
             definitions,
         )
     )
+    effective_edges.extend(_inherited_method_edges(seeds, definitions, effective_edges))
     searcher = RepoSearcher(_AdjacencyGraph(effective_edges))
     selected_ids = seed_ids | {
         neighbor
@@ -392,6 +444,102 @@ def _resolve_calls(definitions: list[Definition], calls: list[CallSite]) -> list
             )
         )
     return edges
+
+
+def _resolve_inheritance(definitions: list[Definition]) -> list[Edge]:
+    classes = [definition for definition in definitions if definition.kind == "class"]
+    by_qualified = {definition.qualified_name: definition for definition in classes}
+    by_name: dict[str, list[Definition]] = {}
+    for definition in classes:
+        by_name.setdefault(definition.name, []).append(definition)
+
+    edges: list[Edge] = []
+    seen: set[tuple[str, str]] = set()
+    for child in classes:
+        for hint in child.base_hints:
+            parent = by_qualified.get(hint)
+            if parent is None:
+                candidates = by_name.get(hint.rsplit(".", 1)[-1], [])
+                if len(candidates) == 1:
+                    parent = candidates[0]
+            if parent is None or parent.id == child.id or (child.id, parent.id) in seen:
+                continue
+            seen.add((child.id, parent.id))
+            edges.append(
+                Edge(
+                    source=child.id,
+                    target=parent.id,
+                    relation="inherits",
+                    path=child.path,
+                    line=child.line,
+                    evidence=f"{child.signature} inherits {parent.qualified_name}",
+                    arguments=(),
+                    keywords=(),
+                    assignment_target="",
+                    resolution="static_class_hierarchy",
+                )
+            )
+    return edges
+
+
+def _inherited_method_edges(
+    seeds: list[Definition],
+    definitions: list[Definition],
+    edges: list[Edge],
+    *,
+    max_consumers_per_method: int = 24,
+) -> list[Edge]:
+    """Connect a changed method directly to classes that inherit its implementation."""
+
+    classes = {
+        definition.qualified_name: definition
+        for definition in definitions
+        if definition.kind == "class"
+    }
+    class_by_id = {definition.id: definition for definition in classes.values()}
+    methods = {
+        (definition.class_qualified_name, definition.name)
+        for definition in definitions
+        if definition.kind == "method" and definition.class_qualified_name
+    }
+    children: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.relation == "inherits" and edge.source in class_by_id and edge.target in class_by_id:
+            children.setdefault(edge.target, []).append(edge.source)
+
+    result: list[Edge] = []
+    for seed in seeds:
+        if seed.kind != "method" or not seed.class_qualified_name:
+            continue
+        owner = classes.get(seed.class_qualified_name)
+        if owner is None:
+            continue
+        queue = sorted(children.get(owner.id, ()))
+        visited: set[str] = set()
+        while queue and len(visited) < max_consumers_per_method:
+            child_id = queue.pop(0)
+            if child_id in visited:
+                continue
+            visited.add(child_id)
+            child = class_by_id[child_id]
+            if (child.qualified_name, seed.name) in methods:
+                continue
+            result.append(
+                Edge(
+                    source=child.id,
+                    target=seed.id,
+                    relation="inherits_method",
+                    path=child.path,
+                    line=child.line,
+                    evidence=f"{child.qualified_name} inherits {seed.qualified_name}",
+                    arguments=(),
+                    keywords=(),
+                    assignment_target="",
+                    resolution="transitive_static_class_hierarchy",
+                )
+            )
+            queue.extend(sorted(children.get(child_id, ())))
+    return result
 
 
 def _anchor_edges(seed: Definition, source: str, definitions: list[Definition]) -> list[Edge]:
@@ -555,7 +703,10 @@ def _inline_projection(target: Definition, anchor_source: str, edge: Edge) -> st
         parameters.pop(0)
     bindings: dict[str, ast.AST] = {}
     binding_text = []
-    for parameter, argument in zip(parameters, edge.arguments):
+    positional_arguments = list(edge.arguments)
+    if target.class_name and len(positional_arguments) == len(parameters) + 1:
+        positional_arguments.pop(0)
+    for parameter, argument in zip(parameters, positional_arguments):
         parsed = _parse_expression(argument)
         if parsed is not None:
             bindings[parameter] = parsed
@@ -651,20 +802,36 @@ def _select_seeds(
     *,
     max_seeds: int,
 ) -> list[Definition]:
-    normalized_terms = {term.strip() for term in seed_terms if term.strip()}
-    changed: list[Definition] = []
-    named: list[Definition] = []
+    normalized_terms = [term.strip() for term in seed_terms if term.strip()]
+    changed_functions: list[Definition] = []
+    changed_classes: list[Definition] = []
     for definition in definitions:
         ranges = changed_ranges.get(definition.path, [])
         if any(definition.line <= end and definition.end_line >= start for start, end in ranges):
-            changed.append(definition)
-        if definition.name in normalized_terms or definition.qualified_name in normalized_terms:
-            named.append(definition)
-    ordered = [*sorted(changed, key=_definition_key), *sorted(named, key=_definition_key)]
+            if definition.kind == "class":
+                changed_classes.append(definition)
+            else:
+                changed_functions.append(definition)
+
+    changed = changed_functions or changed_classes
+    ordered = list(sorted(changed, key=_definition_key))
+    changed_paths = {definition.path for definition in changed}
+    for term in normalized_terms:
+        exact = [definition for definition in definitions if definition.qualified_name == term]
+        matches = exact or [definition for definition in definitions if definition.name == term]
+        if not exact and len(matches) > 3:
+            continue
+        if matches:
+            ordered.append(min(matches, key=lambda item: _seed_rank(item, changed_paths)))
+
     if not ordered and changed_ranges:
         changed_paths = set(changed_ranges)
         ordered = sorted(
-            [definition for definition in definitions if definition.path in changed_paths],
+            [
+                definition
+                for definition in definitions
+                if definition.path in changed_paths and definition.kind != "class"
+            ],
             key=_definition_key,
         )
     unique: list[Definition] = []
@@ -676,6 +843,27 @@ def _select_seeds(
         if len(unique) >= max_seeds:
             break
     return unique
+
+
+def _seed_rank(definition: Definition, changed_paths: set[str]) -> tuple[int, int, int, str, int]:
+    changed_directories = {
+        path.rsplit("/", 1)[0] if "/" in path else ""
+        for path in changed_paths
+    }
+    directory = definition.path.rsplit("/", 1)[0] if "/" in definition.path else ""
+    related = any(
+        directory == changed or directory.startswith(f"{changed}/") or changed.startswith(f"{directory}/")
+        for changed in changed_directories
+        if changed or directory
+    )
+    is_test = "/test" in definition.path or definition.path.startswith("test")
+    return (
+        0 if definition.path in changed_paths else 1,
+        0 if related else 1,
+        1 if is_test else 0,
+        definition.path,
+        definition.line,
+    )
 
 
 def _flatten_context(
@@ -692,7 +880,8 @@ def _flatten_context(
             '<repository_graph_rag schema="trace-r3/1" depth="1" '
             'construction="repograph-one-hop-static-python-ast-no-llm">'
         ),
-        "Retrieval contract: only direct callers and direct callees are included. "
+        "Retrieval contract: only direct callers and direct callees are included, "
+        "plus statically derived inherited-method consumers in one retrieval hop. "
         "Treat edge evidence as navigation evidence, not proof of the bug.",
         "Inline projections are analysis-only views of the failed candidate anchor and are never executed.",
     ]
@@ -710,8 +899,26 @@ def _flatten_context(
                 "</anchor_candidate>",
             ]
         )
-        incoming = sorted((edge for edge in edges if edge.target == seed.id), key=_edge_key)
-        outgoing = sorted((edge for edge in edges if edge.source == seed.id), key=_edge_key)
+        incoming = sorted(
+            (edge for edge in edges if edge.target == seed.id and edge.relation == "calls"),
+            key=_edge_key,
+        )
+        outgoing = sorted(
+            (edge for edge in edges if edge.source == seed.id and edge.relation == "calls"),
+            key=_edge_key,
+        )
+        inherited_consumers = sorted(
+            (edge for edge in edges if edge.target == seed.id and edge.relation == "inherits_method"),
+            key=_edge_key,
+        )
+        inherited_subclasses = sorted(
+            (edge for edge in edges if edge.target == seed.id and edge.relation == "inherits"),
+            key=_edge_key,
+        )
+        base_classes = sorted(
+            (edge for edge in edges if edge.source == seed.id and edge.relation == "inherits"),
+            key=_edge_key,
+        )
         chunks.append("<upstream_callers>")
         if not incoming:
             chunks.append("(none resolved statically)")
@@ -734,6 +941,48 @@ def _flatten_context(
                 ]
             )
         chunks.append("</upstream_callers>")
+        chunks.append("<inherited_method_consumers>")
+        if not inherited_consumers:
+            chunks.append("(none resolved statically)")
+        for edge in inherited_consumers:
+            consumer = by_id[edge.source]
+            chunks.extend(
+                [
+                    f"- {consumer.qualified_name} ({consumer.path}:{consumer.line}) "
+                    f"inherits this implementation",
+                    f"  Edge evidence: {edge.evidence}",
+                    f"  Static resolution: {edge.resolution}",
+                    f"  Consumer signature: {consumer.signature}",
+                    "  ```python",
+                    _source_slice(
+                        consumer.source.splitlines(),
+                        1,
+                        len(consumer.source.splitlines()),
+                        max_lines=12,
+                    ),
+                    "  ```",
+                ]
+            )
+        chunks.append("</inherited_method_consumers>")
+        chunks.append("<inherited_subclasses>")
+        if not inherited_subclasses:
+            chunks.append("(none resolved statically)")
+        for edge in inherited_subclasses:
+            subclass = by_id[edge.source]
+            chunks.append(
+                f"- {subclass.qualified_name} ({subclass.path}:{subclass.line}); "
+                f"evidence: {edge.evidence}"
+            )
+        chunks.append("</inherited_subclasses>")
+        chunks.append("<base_classes>")
+        if not base_classes:
+            chunks.append("(none resolved statically)")
+        for edge in base_classes:
+            base = by_id[edge.target]
+            chunks.append(
+                f"- {base.qualified_name} ({base.path}:{base.line}); evidence: {edge.evidence}"
+            )
+        chunks.append("</base_classes>")
         chunks.append("<downstream_callees>")
         if not outgoing:
             chunks.append("(none resolved statically)")

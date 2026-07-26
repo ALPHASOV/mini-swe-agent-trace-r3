@@ -98,6 +98,14 @@ def test_masked_commands_are_not_replayed():
     assert extract_validation_commands(messages, limit=3) == []
 
 
+def test_arbitrary_success_fallback_is_not_replayed_as_a_test():
+    messages = _messages(
+        'python -m pytest -q || python -c "import package; print(package.__file__)"'
+    )
+
+    assert extract_validation_commands(messages, limit=3) == []
+
+
 def test_import_or_install_pytest_is_not_a_test_command():
     messages = _messages('python -c "import pytest" 2>&1 || pip install pytest')
 
@@ -111,3 +119,44 @@ def test_test_command_after_cd_is_detected():
 
     assert len(candidates) == 1
     assert candidates[0].kind == "test"
+
+
+def test_inline_native_test_api_is_detected():
+    messages = _messages(
+        'cd /testbed && python -c "import sympy; sympy.test(\'sympy/printing/tests/\')"'
+    )
+
+    candidates = extract_validation_commands(messages, limit=3)
+
+    assert len(candidates) == 1
+    assert candidates[0].kind == "test"
+
+
+def test_gate_rejects_zero_exit_test_without_execution_summary(tmp_path):
+    source = _repository(tmp_path)
+    source.write_text("def increment(value):\n    return value + 2\n")
+
+    report = GateEvaluator(TraceR3Config()).evaluate(
+        LocalEnvironment(cwd=str(tmp_path)),
+        _messages('python -m unittest -q 2>/dev/null; printf "runner loaded\\n"'),
+    )
+
+    assert report.state is GateState.RED
+    replay = next(check for check in report.checks if check.name == "replay_test")
+    assert replay.passed is False
+    assert "no positive evidence" in replay.detail
+
+
+def test_gate_rejects_failure_summary_even_when_shell_returns_zero(tmp_path):
+    source = _repository(tmp_path)
+    source.write_text("def increment(value):\n    return value + 2\n")
+
+    report = GateEvaluator(TraceR3Config()).evaluate(
+        LocalEnvironment(cwd=str(tmp_path)),
+        _messages('python -m unittest -q 2>/dev/null; printf "96 passed, 1 failed\\n"'),
+    )
+
+    assert report.state is GateState.RED
+    replay = next(check for check in report.checks if check.name == "replay_test")
+    assert replay.passed is False
+    assert "reports failures" in replay.detail

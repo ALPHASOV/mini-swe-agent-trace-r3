@@ -193,8 +193,7 @@ def test_repeated_failures_recreate_clean_b0_and_stop_after_three_epochs(tmp_pat
     assert "return value + 0" in second_epoch_graph["anchor_sources"]["maths.increment"]
     assert [event["decision"] for event in ledger["events"]] == [
         "rollback",
-        "stack",
         "rollback",
-        "stack",
         "stop",
     ]
+    assert all("identical" in event["reason"] for event in ledger["events"])

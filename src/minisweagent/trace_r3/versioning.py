@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -37,6 +38,7 @@ class HybridVersionController:
         self.sealed_reasons: list[str] = []
         self._last_report: GateReport | None = None
         self._fingerprints_in_epoch: set[str] = set()
+        self._patches_seen: set[str] = set()
         self._non_improving = 0
         self.best_report: GateReport | None = None
         self.best_patch = ""
@@ -47,13 +49,18 @@ class HybridVersionController:
 
         self._last_report = report
         self._fingerprints_in_epoch.add(report.fingerprint())
+        self._remember_patch(report.patch)
         self._consider_best(report, location="baseline")
 
     def decide(self, report: GateReport, *, patch: str, location: str) -> VersionEvent:
         self.checkpoint += 1
-        self._consider_best(report, patch=patch, location=location)
+        patch_identity = _patch_identity(patch)
+        repeated_patch = bool(patch_identity) and patch_identity in self._patches_seen
+        if not repeated_patch:
+            self._consider_best(report, patch=patch, location=location)
 
-        if report.state is GateState.GREEN:
+        if report.state is GateState.GREEN and not repeated_patch:
+            self._remember_patch(patch)
             return self._event(CheckpointDecision.ACCEPT, "All gate checks passed", report)
 
         hard_reason = self._hard_rollback_reason(report)
@@ -61,7 +68,9 @@ class HybridVersionController:
         improved = self._last_report is None or report.score > self._last_report.score
         self._non_improving = 0 if improved else self._non_improving + 1
 
-        if repeated:
+        if repeated_patch:
+            hard_reason = "Candidate patch is identical to an already evaluated candidate"
+        elif repeated:
             hard_reason = "Repeated the same gate failure signature"
         elif self._regressed(report):
             hard_reason = "A previously passing critical check regressed"
@@ -71,6 +80,7 @@ class HybridVersionController:
             hard_reason = f"Reached the per-epoch checkpoint limit ({self.config.max_checkpoints_per_epoch})"
 
         self._fingerprints_in_epoch.add(report.fingerprint())
+        self._remember_patch(patch)
         self._last_report = report
 
         if hard_reason:
@@ -139,3 +149,13 @@ class HybridVersionController:
             self.best_report = report
             self.best_patch = patch or report.patch
             self.best_location = location
+
+    def _remember_patch(self, patch: str) -> None:
+        identity = _patch_identity(patch)
+        if identity:
+            self._patches_seen.add(identity)
+
+
+def _patch_identity(patch: str) -> str:
+    normalized = patch.strip()
+    return hashlib.sha256(normalized.encode()).hexdigest() if normalized else ""

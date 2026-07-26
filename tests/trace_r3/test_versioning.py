@@ -52,6 +52,57 @@ def test_version_controller_stacks_improvement_then_accepts():
     assert controller.best_patch == "A+B+C"
 
 
+def test_identical_green_candidate_seals_the_patch_chain():
+    controller = HybridVersionController(TraceR3Config())
+    baseline = GateReport(
+        state=GateState.AMBER,
+        checks=(
+            GateCheck("patch_nonempty", True, "patch"),
+            GateCheck("diff_check", True, "diff"),
+            GateCheck("python_syntax", True, "syntax"),
+            GateCheck("behavioral_evidence", None, "missing", critical=False),
+        ),
+        patch="A",
+        changed_files=("source.py",),
+        added_lines=1,
+        deleted_lines=0,
+    )
+    controller.observe_baseline(baseline)
+
+    event = controller.decide(
+        _report(GateState.GREEN, replay_passed=True, patch="A"),
+        patch="A",
+        location="e1/c1",
+    )
+
+    assert event.decision is CheckpointDecision.ROLLBACK
+    assert "identical" in event.reason
+    assert controller.best_location == "baseline"
+
+
+def test_identical_patch_remains_sealed_after_clean_base_restart():
+    controller = HybridVersionController(TraceR3Config())
+    baseline = _report(GateState.RED, replay_passed=False, patch="A")
+    controller.observe_baseline(baseline)
+
+    first = controller.decide(
+        _report(GateState.GREEN, replay_passed=True, patch="A"),
+        patch="A",
+        location="e1/c1",
+    )
+    assert first.decision is CheckpointDecision.ROLLBACK
+    controller.begin_next_epoch()
+
+    second = controller.decide(
+        _report(GateState.GREEN, replay_passed=True, patch="A"),
+        patch="A",
+        location="e2/c1",
+    )
+
+    assert second.decision is CheckpointDecision.ROLLBACK
+    assert "identical" in second.reason
+
+
 def test_repeated_failure_seals_epoch_and_third_epoch_stops():
     controller = HybridVersionController(TraceR3Config(max_epochs=3))
     failure = _report(GateState.RED, replay_passed=False, patch="A")
