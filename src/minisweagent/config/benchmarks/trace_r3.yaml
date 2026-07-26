@@ -1,0 +1,20 @@
+# Recovery-only configuration. The CLI merges this after the unchanged
+# swebench.yaml baseline configuration.
+trace_r3:
+  max_epochs: 3
+  max_checkpoints_per_epoch: 3
+  max_non_improving_checkpoints: 2
+  max_replayed_commands: 3
+  validation_timeout_seconds: 900
+  max_patch_files: 12
+  max_patch_lines: 1200
+  graph_depth: 1
+  graph_max_files: 2500
+  graph_max_chars: 14000
+  graph_max_seeds: 12
+  recovery_model:
+    model_class: minisweagent.trace_r3.deepseek.ReasoningReplayLitellmModel
+    model_kwargs:
+      thinking:
+        type: enabled
+      reasoning_effort: max
