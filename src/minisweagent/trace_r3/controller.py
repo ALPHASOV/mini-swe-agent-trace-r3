@@ -24,6 +24,15 @@ from minisweagent.trace_r3.context import (
 from minisweagent.trace_r3.gate import GateEvaluator
 from minisweagent.trace_r3.graph import OneHopGraphRetriever, extract_anchor_sources, extract_seed_terms
 from minisweagent.trace_r3.types import CheckpointDecision, GateReport, GateState, TraceR3Config
+from minisweagent.trace_r3.validation import (
+    ValidationPlan,
+    calibration_errors,
+    execute_validation_plan,
+    parse_validation_plan,
+    planner_revision_prompt,
+    render_validation_plan_markdown,
+    validation_plan_prompt,
+)
 from minisweagent.trace_r3.versioning import HybridVersionController, VersionEvent
 from minisweagent.utils.log import logger
 from minisweagent.utils.serialize import recursive_merge
@@ -95,7 +104,7 @@ class ArtifactStore:
 
 
 class TraceR3Controller:
-    """Baseline-first controller; recovery code is unreachable before Gate G0."""
+    """Freeze validation, run the baseline, and keep recovery unreachable before G0."""
 
     def __init__(
         self,
@@ -118,14 +127,16 @@ class TraceR3Controller:
         self.gate = GateEvaluator(self.trace_config)
         self.graph = OneHopGraphRetriever(self.trace_config)
         self.versions = HybridVersionController(self.trace_config)
+        self.validation_plan: ValidationPlan | None = None
         self.manifest: dict[str, Any] = {
-            "schema_version": "trace-r3-run/1",
+            "schema_version": "trace-r3-run/2",
             "instance_id": self.instance_id,
             "attempt": self.attempt_number,
             "started_at": time.time(),
             "phase": "starting",
             "recovery_activated": False,
             "activation_rule": "only_after_baseline_gate_is_not_green",
+            "validation_rule": "independent_plan_frozen_before_any_patch",
             "trace_r3_config": self.trace_config.to_dict(),
             "stages": [],
         }
@@ -133,10 +144,15 @@ class TraceR3Controller:
     def run(self) -> TraceR3Result:
         env: Environment | None = None
         self.progress_manager.on_instance_start(self.instance_id)
-        self._status("Starting unchanged baseline")
+        self._status("Starting independent pre-patch validation")
         self._save_manifest()
         try:
             env = get_sb_environment(self.config, self.instance)
+            self.validation_plan = self._prepare_frozen_validation(env)
+            _cleanup(env)
+            env = get_sb_environment(self.config, self.instance)
+
+            self._status("Starting unchanged baseline patch conversation")
             baseline_dir = self.store.root / "baseline"
             baseline_dir.mkdir(parents=True, exist_ok=True)
             baseline = self._run_agent(
@@ -147,7 +163,12 @@ class TraceR3Controller:
                 trajectory_path=baseline_dir / "baseline.traj.json",
                 stage={"kind": "baseline", "enhancements_active": False},
             )
-            baseline_gate = self.gate.evaluate(env, self._last_messages)
+            baseline_gate = self._evaluate_candidate(
+                env,
+                self._last_messages,
+                baseline_dir,
+                phase="baseline",
+            )
             self.store.save_gate(baseline_dir, baseline_gate)
             self.versions.observe_baseline(baseline_gate)
             self._record_stage(
@@ -215,7 +236,12 @@ class TraceR3Controller:
                     },
                 )
                 model_name = recovery.model_name
-                report = self.gate.evaluate(env, self._last_messages)
+                report = self._evaluate_candidate(
+                    env,
+                    self._last_messages,
+                    stage_dir,
+                    phase=f"epoch-{epoch:02d}/checkpoint-{checkpoint:02d}",
+                )
                 self.store.save_gate(stage_dir, report)
                 event = self.versions.decide(
                     report,
@@ -353,6 +379,186 @@ class TraceR3Controller:
         terms = extract_seed_terms(self.problem_statement, report.patch)
         return self.graph.retrieve(env, seed_terms=terms, anchor_sources=anchor_sources)
 
+    def _prepare_frozen_validation(self, env: Environment) -> ValidationPlan:
+        self._status("Generating independent pre-patch validation plan")
+        validation_dir = self.store.root / "validation"
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        graph = self.graph.retrieve(
+            env,
+            seed_terms=extract_seed_terms(self.problem_statement, ""),
+        )
+        graph["llm_consumption"] = {
+            **graph.get("llm_consumption", {}),
+            "placement": "independent validation-planner conversation before any patch",
+        }
+        self.store.write_json("validation/input_graph.json", graph)
+        self.store.write_text("validation/rag_context.md", graph.get("rag_context", ""))
+
+        model = get_model(config=self._validation_model_config())
+        messages = [
+            model.format_message(
+                role="system",
+                content=(
+                    "You are a read-only validation planner. No patch exists. "
+                    "Return only the requested JSON plan and never call tools or propose source changes."
+                ),
+            ),
+            model.format_message(
+                role="user",
+                content=validation_plan_prompt(self.problem_statement, graph, self.trace_config),
+            ),
+        ]
+        last_error = ""
+        for attempt in range(1, self.trace_config.validation_plan_generation_attempts + 1):
+            response = model.query(messages, tool_choice="none")
+            messages.append(response)
+            self.store.write_text(
+                f"validation/draft-{attempt:02d}/response.txt",
+                str(response.get("content") or ""),
+            )
+            try:
+                plan = parse_validation_plan(str(response.get("content") or ""), self.trace_config)
+            except ValueError as error:
+                last_error = str(error)
+                self.store.write_json(
+                    f"validation/draft-{attempt:02d}/rejection.json",
+                    {"errors": [last_error]},
+                )
+                self._save_planner_trajectory(model, messages, "PlanFormatRejected")
+                if attempt < self.trace_config.validation_plan_generation_attempts:
+                    messages.append(
+                        model.format_message(
+                            role="user",
+                            content=(
+                                "The draft was rejected before any patch existed: "
+                                f"{last_error}. Replace it with one complete JSON plan."
+                            ),
+                        )
+                    )
+                continue
+
+            self.store.write_json(f"validation/draft-{attempt:02d}/plan.json", plan.to_dict())
+            calibration = execute_validation_plan(
+                env,
+                plan,
+                phase=f"b0-draft-{attempt:02d}",
+                timeout=self.trace_config.validation_timeout_seconds,
+            )
+            self.store.write_json(
+                f"validation/draft-{attempt:02d}/b0_results.json",
+                calibration.to_dict(),
+            )
+            errors = calibration_errors(plan, calibration)
+            purity = env.execute(
+                {"command": "git diff --quiet -- . ':(exclude)patch.txt'"},
+                timeout=self.trace_config.validation_timeout_seconds,
+            )
+            if purity["returncode"] != 0:
+                self.store.write_json(
+                    f"validation/draft-{attempt:02d}/rejection.json",
+                    {"errors": ["validation commands modified tracked source files"]},
+                )
+                self._save_planner_trajectory(model, messages, "PlanPurityViolation")
+                raise RuntimeError(
+                    "Pre-patch validation modified tracked source files; refusing to start patch generation"
+                )
+            if errors:
+                last_error = "; ".join(errors)
+                self.store.write_json(
+                    f"validation/draft-{attempt:02d}/rejection.json",
+                    {"errors": errors},
+                )
+                self._save_planner_trajectory(model, messages, "PlanCalibrationRejected")
+                if attempt < self.trace_config.validation_plan_generation_attempts:
+                    messages.append(
+                        model.format_message(
+                            role="user",
+                            content=planner_revision_prompt(errors, calibration),
+                        )
+                    )
+                continue
+
+            self.store.write_json("validation/frozen_plan.json", plan.to_dict())
+            self.store.write_text("validation/frozen_plan.md", render_validation_plan_markdown(plan))
+            self.store.write_text("validation/frozen_plan.sha256", f"{plan.identity}\n")
+            self.store.write_json("validation/b0_results.json", calibration.to_dict())
+            self._save_planner_trajectory(model, messages, "FrozenValidationPlanReady")
+            self.manifest["validation"] = {
+                "plan_identity": plan.identity,
+                "case_count": len(plan.cases),
+                "test_command_count": sum(case.kind == "test" for case in plan.cases),
+                "generated_before_baseline": True,
+                "separate_from_patch_conversations": True,
+                "b0_calibrated": True,
+            }
+            self.manifest["phase"] = "validation_frozen"
+            self._save_manifest()
+            return plan
+        raise RuntimeError(
+            "Unable to freeze a valid pre-patch validation plan after "
+            f"{self.trace_config.validation_plan_generation_attempts} attempts: {last_error}"
+        )
+
+    def _evaluate_candidate(
+        self,
+        env: Environment,
+        messages: list[dict[str, Any]],
+        directory: Path,
+        *,
+        phase: str,
+    ) -> GateReport:
+        if self.validation_plan is None:
+            raise RuntimeError("Candidate evaluation requires a frozen pre-patch validation plan")
+        self._status(f"Executing all {len(self.validation_plan.cases)} frozen validation cases")
+        run = execute_validation_plan(
+            env,
+            self.validation_plan,
+            phase=phase,
+            timeout=self.trace_config.validation_timeout_seconds,
+        )
+        self.store.write_json(
+            directory.relative_to(self.store.root) / "validation_results.json",
+            run.to_dict(),
+        )
+        return self.gate.evaluate(env, messages, frozen_checks=run.gate_checks())
+
+    def _save_planner_trajectory(
+        self,
+        model,
+        messages: list[dict[str, Any]],
+        exit_status: str,
+    ) -> None:
+        cost = sum(message.get("extra", {}).get("cost", 0.0) for message in messages)
+        data = recursive_merge(
+            {
+                "trajectory_format": "mini-swe-agent-1.1",
+                "messages": messages,
+                "instance_id": self.instance_id,
+                "info": {
+                    "exit_status": exit_status,
+                    "submission": "",
+                    "model_stats": {
+                        "instance_cost": cost,
+                        "api_calls": sum(message.get("role") == "assistant" for message in messages),
+                    },
+                    "trace_r3": {
+                        "kind": "validation_planning",
+                        "patch_available": False,
+                        "separate_conversation": True,
+                    },
+                },
+            },
+            model.serialize(),
+        )
+        self.store.write_json("validation/planner.traj.json", data)
+
+    def _validation_model_config(self) -> dict[str, Any]:
+        baseline = self.config.get("model", {})
+        merged = recursive_merge(baseline, self.trace_config.validation_model)
+        if merged.get("model_name") != baseline.get("model_name"):
+            raise ValueError("Validation planning must retain the baseline model_name")
+        return merged
+
     def _recovery_model_config(self) -> dict[str, Any]:
         baseline = self.config.get("model", {})
         merged = recursive_merge(baseline, self.trace_config.recovery_model)
@@ -389,6 +595,7 @@ class TraceR3Controller:
             "model_name": outcome.model_name,
             "gate": report.to_dict(include_patch=False),
             "error": outcome.error,
+            "validation_plan_identity": self.validation_plan.identity if self.validation_plan else "",
         }
         if graph is not None:
             stage["graph"] = graph_summary_for_manifest(graph)
@@ -422,6 +629,7 @@ class TraceR3Controller:
                 "selected_location": result.selected_location,
                 "patch_chars": len(result.patch),
                 "version_ledger": self.versions.to_dict(),
+                "validation_plan_identity": self.validation_plan.identity if self.validation_plan else "",
             },
         )
         self.manifest.update(

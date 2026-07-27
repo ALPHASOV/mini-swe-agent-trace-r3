@@ -1,4 +1,4 @@
-"""DeepSeek V4 tool-call history compatibility for recovery turns."""
+"""DeepSeek V4 reasoning and tool-call history compatibility."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ class ReasoningReplayLitellmModel(LitellmModel):
 
     LiteLLM already keeps ``reasoning_content`` when the response message is
     serialized. DeepSeek V4 additionally requires a non-null assistant content
-    field on tool-call history. This adapter is instantiated only for recovery,
-    after Gate G0 has failed.
+    field on tool-call history. TRACE-R³ uses this adapter for the independent
+    read-only validation-planning conversation and for recovery after Gate G0.
     """
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:

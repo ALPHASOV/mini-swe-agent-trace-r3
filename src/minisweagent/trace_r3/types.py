@@ -102,8 +102,12 @@ class GateReport:
 
 @dataclass(frozen=True)
 class TraceR3Config:
-    """Recovery policy. The initial baseline run never reads these settings."""
+    """Frozen-validation and recovery policy."""
 
+    validation_plan_min_cases: int = 10
+    validation_plan_max_cases: int = 16
+    validation_plan_min_test_commands: int = 2
+    validation_plan_generation_attempts: int = 3
     max_epochs: int = 3
     max_checkpoints_per_epoch: int = 3
     max_non_improving_checkpoints: int = 2
@@ -115,6 +119,15 @@ class TraceR3Config:
     graph_max_files: int = 2500
     graph_max_chars: int = 14_000
     graph_max_seeds: int = 12
+    validation_model: dict[str, Any] = field(
+        default_factory=lambda: {
+            "model_class": "minisweagent.trace_r3.deepseek.ReasoningReplayLitellmModel",
+            "model_kwargs": {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "max",
+            },
+        }
+    )
     recovery_model: dict[str, Any] = field(
         default_factory=lambda: {
             "model_class": "minisweagent.trace_r3.deepseek.ReasoningReplayLitellmModel",
@@ -127,6 +140,14 @@ class TraceR3Config:
     recovery_agent: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.validation_plan_min_cases < 10:
+            raise ValueError("frozen validation requires at least ten cases")
+        if self.validation_plan_max_cases < self.validation_plan_min_cases:
+            raise ValueError("validation_plan_max_cases must not be smaller than its minimum")
+        if self.validation_plan_min_test_commands < 2:
+            raise ValueError("frozen validation requires at least two native test commands")
+        if self.validation_plan_generation_attempts < 1:
+            raise ValueError("validation_plan_generation_attempts must be positive")
         if self.max_epochs < 1 or self.max_epochs > 3:
             raise ValueError("TRACE-R³ supports between one and three epochs")
         if self.max_checkpoints_per_epoch < 1:

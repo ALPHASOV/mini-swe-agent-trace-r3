@@ -1,6 +1,10 @@
-# Recovery-only configuration. The CLI merges this after the unchanged
-# swebench.yaml baseline configuration.
+# Frozen-validation and recovery configuration. The CLI merges this after the
+# unchanged swebench.yaml patch-agent configuration.
 trace_r3:
+  validation_plan_min_cases: 10
+  validation_plan_max_cases: 16
+  validation_plan_min_test_commands: 2
+  validation_plan_generation_attempts: 3
   max_epochs: 3
   max_checkpoints_per_epoch: 3
   max_non_improving_checkpoints: 2
@@ -12,6 +16,12 @@ trace_r3:
   graph_max_files: 2500
   graph_max_chars: 14000
   graph_max_seeds: 12
+  validation_model:
+    model_class: minisweagent.trace_r3.deepseek.ReasoningReplayLitellmModel
+    model_kwargs:
+      thinking:
+        type: enabled
+      reasoning_effort: max
   recovery_model:
     model_class: minisweagent.trace_r3.deepseek.ReasoningReplayLitellmModel
     model_kwargs:

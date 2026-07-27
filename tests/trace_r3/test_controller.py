@@ -38,8 +38,17 @@ def _repository(tmp_path):
         "def test_increment():\n"
         "    assert increment(1) == 3\n"
     )
+    (repository / "test_regression.py").write_text(
+        "from maths import increment\n\n"
+        "def test_increment_remains_callable():\n"
+        "    assert callable(increment)\n"
+    )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    subprocess.run(["git", "add", "maths.py", "test_maths.py"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "add", "maths.py", "test_maths.py", "test_regression.py"],
+        cwd=repository,
+        check=True,
+    )
     subprocess.run(
         ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "base"],
         cwd=repository,
@@ -71,6 +80,44 @@ def _submit_action() -> dict:
     return make_output("submitting", [{"command": command}], cost=0.01)
 
 
+def _validation_plan_output() -> dict:
+    cases = [
+        ("vp01", "direct_reproduction", "reproduction", "direct one", "python -c \"from maths import increment; assert increment(1) == 3\"", "fail"),
+        ("vp02", "direct_reproduction", "reproduction", "direct zero", "python -c \"from maths import increment; assert increment(0) == 2\"", "fail"),
+        ("vp03", "boundary", "reproduction", "negative boundary", "python -c \"from maths import increment; assert increment(-1) == 1\"", "fail"),
+        ("vp04", "boundary", "reproduction", "large boundary", "python -c \"from maths import increment; assert increment(100) == 102\"", "fail"),
+        ("vp05", "metamorphic", "reproduction", "offset invariant", "python -c \"from maths import increment; assert increment(4) - 4 == 2\"", "fail"),
+        ("vp06", "metamorphic", "reproduction", "difference invariant", "python -c \"from maths import increment; assert increment(4) - increment(3) == 1\"", "pass"),
+        ("vp07", "cross_consumer", "reproduction", "map consumer", "python -c \"from maths import increment; assert list(map(increment, [0, 1])) == [2, 3]\"", "fail"),
+        ("vp08", "cross_consumer", "reproduction", "sum consumer", "python -c \"from maths import increment; assert sum(map(increment, [0, 1])) == 5\"", "fail"),
+        ("vp09", "focused_regression", "test", "focused native test", "python -m pytest -q test_maths.py", "fail"),
+        ("vp10", "broad_regression", "test", "bounded regression", "python -m pytest -q test_regression.py", "pass"),
+    ]
+    return make_output(
+        json.dumps(
+            {
+                "schema_version": "trace-r3-frozen-validation/1",
+                "objective": "increment adds two while retaining its callable contract",
+                "cases": [
+                    {
+                        "case_id": case_id,
+                        "category": category,
+                        "kind": kind,
+                        "title": title,
+                        "rationale": f"independent coverage for {title}",
+                        "command": command,
+                        "oracle": f"{title} behaves correctly",
+                        "expected_on_base": expected,
+                    }
+                    for case_id, category, kind, title, command, expected in cases
+                ],
+            }
+        ),
+        [],
+        cost=0.01,
+    )
+
+
 def _config(repository, baseline_outputs, recovery_outputs=None):
     config = {
         "agent": {
@@ -90,13 +137,17 @@ def _config(repository, baseline_outputs, recovery_outputs=None):
             "outputs": baseline_outputs,
             "cost_per_call": 0.01,
         },
+        "trace_r3": {
+            "validation_model": {
+                "model_name": "deterministic",
+                "outputs": [_validation_plan_output()],
+            }
+        },
     }
     if recovery_outputs is not None:
-        config["trace_r3"] = {
-            "recovery_model": {
-                "model_name": "deterministic",
-                "outputs": recovery_outputs,
-            }
+        config["trace_r3"]["recovery_model"] = {
+            "model_name": "deterministic",
+            "outputs": recovery_outputs,
         }
     return config
 
@@ -125,6 +176,9 @@ def test_green_baseline_never_activates_recovery(tmp_path, reset_global_stats):
     assert manifest["recovery_activated"] is False
     assert manifest["stages"][0]["enhancements_active"] is False
     assert not (instance_dir / "recovery").exists()
+    assert (instance_dir / "validation" / "frozen_plan.json").is_file()
+    assert (instance_dir / "validation" / "planner.traj.json").is_file()
+    assert len(json.loads((instance_dir / "baseline" / "validation_results.json").read_text())["results"]) == 10
     assert (instance_dir / "baseline" / "baseline.traj.json").is_file()
     assert (instance_dir / "final" / "model.patch").read_text() == result.patch
     assert json.loads((instance_root / "latest_attempt.json").read_text())["path"] == "attempt-001"
@@ -142,6 +196,11 @@ def test_failed_baseline_activates_graph_and_recovery(tmp_path, reset_global_sta
     checkpoint = instance_dir / "recovery" / "epoch-01" / "checkpoint-01"
     manifest = json.loads((instance_dir / "run_manifest.json").read_text())
     graph = json.loads((checkpoint / "input_graph.json").read_text())
+    plan = json.loads((instance_dir / "validation" / "frozen_plan.json").read_text())
+    baseline_validation = json.loads((instance_dir / "baseline" / "validation_results.json").read_text())
+    recovery_validation = json.loads((checkpoint / "validation_results.json").read_text())
+    baseline_trajectory = json.loads((instance_dir / "baseline" / "baseline.traj.json").read_text())
+    recovery_prompt = (checkpoint / "prompt.md").read_text()
     assert result.exit_status == "RecoveryGatePassed"
     assert result.recovery_activated is True
     assert manifest["recovery_activated"] is True
@@ -149,6 +208,13 @@ def test_failed_baseline_activates_graph_and_recovery(tmp_path, reset_global_sta
     assert manifest["stages"][1]["enhancements_active"] is True
     assert graph["depth"] == 1
     assert graph["llm_consumption"]["format"] == "repograph_one_hop_with_inlinecoder_projection"
+    assert len(plan["cases"]) == 10
+    assert baseline_validation["plan_identity"] == recovery_validation["plan_identity"]
+    assert len(baseline_validation["results"]) == len(recovery_validation["results"]) == 10
+    assert "vp01" not in json.dumps(baseline_trajectory)
+    assert "<case id=\"vp01\">" in recovery_prompt
+    assert "vp06" not in recovery_prompt
+    assert "vp10" not in recovery_prompt
     assert (checkpoint / "recovery.traj.json").is_file()
     assert (checkpoint / "rag_context.md").read_text() in (checkpoint / "prompt.md").read_text()
     assert "return value + 2" in result.patch
@@ -186,8 +252,8 @@ def test_repeated_failures_recreate_clean_b0_and_stop_after_three_epochs(tmp_pat
         (attempt / "recovery" / "epoch-02" / "checkpoint-01" / "input_graph.json").read_text()
     )
     assert result.exit_status == "TraceR3Exhausted"
-    assert ResettingLocalEnvironment.generations == 3
-    assert ResettingLocalEnvironment.clean_snapshots == ["", "", ""]
+    assert ResettingLocalEnvironment.generations == 4
+    assert ResettingLocalEnvironment.clean_snapshots == ["", "", "", ""]
     assert second_epoch_graph["changed_ranges"] == {}
     assert second_epoch_graph["anchor_provenance"] == "external_failed_candidate"
     assert "return value + 0" in second_epoch_graph["anchor_sources"]["maths.increment"]

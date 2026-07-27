@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run baseline-first TRACE-R³ recovery on SWE-bench."""
+"""Run frozen-validation, baseline-first TRACE-R³ recovery on SWE-bench."""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ DEFAULT_CONFIG_SPECS = [
 
 
 @app.command(
-    help="Run the unchanged mini-SWE-agent baseline, then activate TRACE-R³ only when Gate G0 is not green."
+    help=(
+        "Freeze an independent pre-patch validation plan, run the unchanged "
+        "mini-SWE-agent baseline, then activate recovery only when Gate G0 is not green."
+    )
 )
 def main(
     subset: str = typer.Option("verified", "--subset", help="SWE-bench subset or dataset path"),

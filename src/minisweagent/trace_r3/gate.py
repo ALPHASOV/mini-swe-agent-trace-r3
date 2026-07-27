@@ -68,7 +68,13 @@ class GateEvaluator:
     def __init__(self, config: TraceR3Config):
         self.config = config
 
-    def evaluate(self, env: Environment, messages: list[dict[str, Any]]) -> GateReport:
+    def evaluate(
+        self,
+        env: Environment,
+        messages: list[dict[str, Any]],
+        *,
+        frozen_checks: tuple[GateCheck, ...] = (),
+    ) -> GateReport:
         patch_result = self._execute(env, "git diff --binary -- . ':(exclude)patch.txt'")
         patch = patch_result["output"] if patch_result["returncode"] == 0 else ""
         changed_files = self._changed_files(env)
@@ -89,8 +95,11 @@ class GateEvaluator:
         candidates = extract_validation_commands(messages, limit=self.config.max_replayed_commands)
         replay_checks = [self._replay(env, candidate) for candidate in candidates]
         checks.extend(replay_checks)
+        checks.extend(frozen_checks)
 
-        has_test = any(candidate.kind == "test" for candidate in candidates)
+        has_test = any(candidate.kind == "test" for candidate in candidates) or any(
+            check.name.startswith("frozen_validation.") for check in frozen_checks
+        )
         has_repro = any(candidate.kind == "reproduction" for candidate in candidates)
         behavioral_passed = True if has_test else None
         behavioral_detail = (
@@ -110,7 +119,12 @@ class GateEvaluator:
             changed_files=tuple(changed_files),
             added_lines=added_lines,
             deleted_lines=deleted_lines,
-            tested_commands=tuple(candidate.command for candidate in candidates),
+            tested_commands=tuple(candidate.command for candidate in candidates)
+            + tuple(
+                check.command
+                for check in frozen_checks
+                if check.name.startswith("frozen_validation.") and check.command
+            ),
             reason=reason,
         )
 

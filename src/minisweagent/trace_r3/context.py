@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable
 
 from minisweagent.trace_r3.types import GateReport
+from minisweagent.trace_r3.validation import failed_validation_feedback
 
 RECOVERY_SYSTEM_TEMPLATE = """You are the recovery stage of TRACE-R³.
 
@@ -47,8 +48,12 @@ def build_recovery_task(
     gate_lines = [
         f"- {check.name}: {_status(check.passed)} — {check.detail}"
         for check in gate_report.checks
-        if check.passed is not True or check.name.startswith("replay_")
+        if (
+            (check.passed is not True or check.name.startswith("replay_"))
+            and not check.name.startswith("frozen_validation.")
+        )
     ]
+    validation_feedback = failed_validation_feedback(gate_report.checks)
     sealed = "\n".join(f"- {reason}" for reason in sealed_reasons) or "- None"
     patch = _bounded(failed_patch, 18_000)
     graph_context = graph_artifact.get("rag_context", "")
@@ -71,6 +76,8 @@ def build_recovery_task(
 Reason: {gate_report.reason}
 {chr(10).join(gate_lines)}
 </execution_gate>
+
+{validation_feedback}
 
 <sealed_failure_patterns>
 {sealed}
